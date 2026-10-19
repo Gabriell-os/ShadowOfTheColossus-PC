@@ -119,6 +119,7 @@ void BufferCache::TickFrame() {
 
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks,
                                    bool guest_fault) {
+    if (SotcStats::kCmdStats) SotcStats::inv_buffer.fetch_add(size, std::memory_order_relaxed);
     Core::MemoryManager::NoteHostWrite(device_addr, size, 9,
                                        reinterpret_cast<u64>(__builtin_return_address(0)));
     memory_tracker->InvalidateRegion(
@@ -171,7 +172,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         DownloadMemory(arena, window_start, window_end - window_start);
         fault_size = 0;
         if (is_write) {
-            memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+            MarkCpuModifiedAfterReadback(device_addr, size);
         }
     };
     if (assume_locks) {
@@ -198,6 +199,28 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     scheduler.WaitSubmitted(readback.tick, false);
     scheduler.GetWorkSemaphore()->Wait(readback.tick);
     liverpool->SendCommand<true>([this, &readback] { FinishAsyncReadback(readback); });
+}
+
+void BufferCache::MarkCpuModifiedAfterReadback(VAddr device_addr, u64 size) {
+    // sotc: a write fault after its readback. A page both CPU- and GPU-modified keeps its read
+    // watcher but loses its write watcher, a "write-only" protection the host does not have (the
+    // page_manager assertion). The tracker can still mark these pages GPU-modified for two
+    // reasons: GPU data recorded since the readback (left protected: the write faults again and
+    // the next readback brings it), or a page bit no GPU-written byte backs any more, e.g. after
+    // ReleaseMemory (cleared, or the write would fault forever). After Oussama268's 9afd8e5.
+    if (memory_tracker->IsRegionGpuModified(device_addr, size)) {
+        const VAddr lo = Common::AlignDown(device_addr, VAddr{4096});
+        const VAddr hi = Common::AlignUp(device_addr + size, VAddr{4096});
+        bool gpu_data = false;
+        gpu_modified_ranges.ForEachInRange(lo, hi - lo, [&](VAddr, VAddr) { gpu_data = true; });
+        if (gpu_data) {
+            SotcStats::write_fault_gpu_pending.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        SotcStats::write_fault_stale_gpu.fetch_add(1, std::memory_order_relaxed);
+        memory_tracker->UnmarkRegionAsGpuModified(lo, hi - lo, false);
+    }
+    memory_tracker->MarkRegionAsCpuModified(device_addr, size);
 }
 
 void BufferCache::BeginAsyncReadback(AsyncReadback& readback) {
@@ -228,7 +251,7 @@ void BufferCache::BeginAsyncReadback(AsyncReadback& readback) {
             return;
         }
         if (readback.is_write) {
-            memory_tracker->MarkRegionAsCpuModified(readback.device_addr, readback.size);
+            MarkCpuModifiedAfterReadback(readback.device_addr, readback.size);
         }
         return;
     }
@@ -284,13 +307,13 @@ void BufferCache::FinishAsyncReadback(AsyncReadback& readback) {
             FinishAsyncReadback(*other);
         }
         if (readback.is_write) {
-            memory_tracker->MarkRegionAsCpuModified(readback.device_addr, readback.size);
+            MarkCpuModifiedAfterReadback(readback.device_addr, readback.size);
         }
         return;
     }
     if (readback.finished) {
         if (readback.is_write) {
-            memory_tracker->MarkRegionAsCpuModified(readback.device_addr, readback.size);
+            MarkCpuModifiedAfterReadback(readback.device_addr, readback.size);
         }
         return;
     }
@@ -320,7 +343,7 @@ void BufferCache::FinishAsyncReadback(AsyncReadback& readback) {
         staging_pool.FreeDeferred(download);
     }
     if (readback.is_write) {
-        memory_tracker->MarkRegionAsCpuModified(readback.device_addr, readback.size);
+        MarkCpuModifiedAfterReadback(readback.device_addr, readback.size);
     }
 }
 
@@ -798,6 +821,49 @@ bool BufferCache::TryReplaceFromCpu(VAddr addr, const void* data, u64 size) {
     return true;
 }
 
+bool BufferCache::TryWriteThroughFromCpu(VAddr addr, const void* data, u64 size) {
+    if (size == 0) {
+        return true;
+    }
+    const u64 first_block = addr >> block_shift;
+    const u64 last_block = (addr + size - 1) >> block_shift;
+    bool resident = true;
+    resident_ranges.ForEachGap(first_block, last_block + 1, [&](u64, u64) { resident = false; });
+    const Buffer* arena =
+        resident ? address_space[first_block >> blocks_per_arena_page_shift] : nullptr;
+    if (!arena || arena != address_space[last_block >> blocks_per_arena_page_shift]) {
+        return TryReplaceFromCpu(addr, data, size);
+    }
+    if (!memory->GetBackingPointer(addr) || !memory->GetBackingPointer(addr + size - 1)) {
+        return false;
+    }
+    // Page tracking is page granular: other GPU-written bytes on these pages would be lost.
+    const VAddr lo = Common::AlignDown(addr, VAddr{4096});
+    const VAddr hi = Common::AlignUp(addr + size, VAddr{4096});
+    bool foreign = false;
+    gpu_modified_ranges.ForEachInRange(lo, hi - lo, [&](VAddr start, VAddr end) {
+        foreign |= start < addr || end > addr + size;
+    });
+    if (foreign) {
+        return false;
+    }
+    gpu_modified_ranges.Subtract(addr, size);
+    memory_tracker->UnmarkRegionAsGpuModified(addr, size, false);
+    MarkInflightReadbacksDirty(addr, size);
+    if (!memory->TryWriteBacking(std::bit_cast<void*>(addr), data, size, 10)) {
+        return false;
+    }
+    // The arena gets the same bytes now, in stream order, so the CPU bits stay as they are: a
+    // clean page stays clean and write-protected, a dirty one uploads the same bytes later.
+    const auto staging = staging_pool.Request(size, MemoryType::HostUncached);
+    std::memcpy(staging.mapped, data, size);
+    staging.Flush();
+    const vk::BufferCopy copy{staging.offset, arena->Offset(addr), size};
+    runtime.CopyBuffer(staging.buffer, arena, std::span{&copy, 1});
+    RecordCurrentWrite(addr, size);
+    return true;
+}
+
 bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
     return memory_tracker->IsRegionGpuModified(addr, size);
 }
@@ -806,6 +872,7 @@ void BufferCache::SynchronizeDmaBuffers() {
     const SotcStats::FrameTimer frame_timer{SotcStats::FrameDma};
     fault_process_pending = true;
     const u64 uploads_before = SotcStats::uploads.load(std::memory_order_relaxed);
+    const auto sweep_start = std::chrono::steady_clock::now();
     u64 ranges = 0;
     // sotc (SOTC_DMA_MERGE=0 disables): the sweep visited ~1200 resident ranges ~100 times a
     // second, one tracker walk + staging request each. Touching ranges whose start maps to the
@@ -854,6 +921,7 @@ void BufferCache::SynchronizeDmaBuffers() {
                               static_cast<u32>(size), false, false);
         }
         ranges = dma_runs_ranges;
+        SotcStats::dma_sweep_runs.fetch_add(dma_runs.size(), std::memory_order_relaxed);
     } else {
         for (const auto& range : resident_ranges) {
             const u64 page = range.start >> (ARENA_PAGE_BITS - block_shift);
@@ -865,8 +933,14 @@ void BufferCache::SynchronizeDmaBuffers() {
     }
     SotcStats::dma_sweeps.fetch_add(1, std::memory_order_relaxed);
     SotcStats::dma_sweep_ranges.fetch_add(ranges, std::memory_order_relaxed);
+    const u64 sweep_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - sweep_start)
+                             .count();
+    SotcStats::dma_sweep_ns.fetch_add(sweep_ns, std::memory_order_relaxed);
     if (SotcStats::uploads.load(std::memory_order_relaxed) != uploads_before) {
         SotcStats::dma_sweep_uploading.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        SotcStats::dma_sweep_idle_ns.fetch_add(sweep_ns, std::memory_order_relaxed);
     }
 }
 
@@ -958,6 +1032,14 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
 }
 
 void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_block) {
+    // sotc: binds check the same ranges thousands of times a frame, each a search of ~2,600
+    // resident ranges (~2% of the command processor): ranges found resident are remembered
+    // (64 slots by first block) until the resident set changes (resident_version).
+    auto& cached = resident_cache[(first_block * 0x9E3779B97F4A7C15ull) >> 58];
+    if (cached.version == resident_version && first_block >= cached.first &&
+        last_block < cached.end) {
+        return;
+    }
     u32 resident_blocks{};
     IntervalList bind_ranges;
     resident_ranges.ForEachGap(first_block, last_block + 1, [&](u64 start, u64 end) {
@@ -966,6 +1048,7 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     });
 
     if (bind_ranges.Empty()) {
+        cached = {resident_version, first_block, last_block + 1};
         return;
     }
     const SotcStats::FrameTimer frame_timer{SotcStats::FrameAlloc};

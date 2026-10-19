@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <array>
+
 #include <chrono>
 #include <deque>
 #include <map>
@@ -113,6 +115,12 @@ public:
     /// GPU-written bytes share its pages: the range stops being GPU-modified, so reading it
     /// back costs no readback. False (nothing done) otherwise.
     bool TryReplaceFromCpu(VAddr addr, const void* data, u64 size);
+
+    /// sotc: TryReplaceFromCpu that also copies `data` into the resident arena right away, so
+    /// the range is not marked CPU-written: no unprotect, upload and protect again later (two
+    /// page protection system calls per replaced range). Data the guest never writes itself
+    /// (fill-shader tables written by the command processor). Not resident: TryReplaceFromCpu.
+    bool TryWriteThroughFromCpu(VAddr addr, const void* data, u64 size);
 
     /// Byte-precise: true when a written binding covered any byte of the range since its last
     /// readback. Readbacks copy only these bytes, so the backing holds every other byte.
@@ -248,6 +256,13 @@ private:
     /// sotc: bumped at every resident_ranges.Add/Subtract. SynchronizeDmaBuffers rebuilds its
     /// merged runs only when this (or the arena count) changed since the last rebuild.
     u64 resident_version{};
+    /// sotc: block ranges found resident at a resident_version (EnsureResident).
+    struct ResidentCacheEntry {
+        u64 version{~u64{0}};
+        u64 first{};
+        u64 end{};
+    };
+    std::array<ResidentCacheEntry, 64> resident_cache{};
     u64 dma_runs_version = ~0ULL;
     size_t dma_runs_arenas{};
     u64 dma_runs_ranges{};
@@ -284,6 +299,7 @@ private:
     bool clean_pages_used = false;
     std::atomic<u64> clean_map_generation{};
     void AddGpuModified(VAddr addr, u64 size);
+    void MarkCpuModifiedAfterReadback(VAddr device_addr, u64 size);
 
     /// GPU writes recorded into the command buffer still being built (tick current_writes_tick).
     RangeSet current_writes;

@@ -9,18 +9,23 @@ Settings (environment variables, or sotc.ini beside this script as NAME=value li
     SOTC_SYS_MODULES  folder with YOUR OWN console's decrypted libSceNgs2.sprx and
                       libSceUlt.sprx (shadPS4's user/sys_modules). Without it the game is silent.
                       These files are Sony firmware: they are never distributed with the port.
-    SOTC_USER_DIR     saves, shader/pipeline caches; default ./user
+    SOTC_USER_DIR     saves, shader/pipeline caches; default <data>/user
+    SOTC_DATA_DIR     writable folder for sotc.ini, the prepared image (out/) and user/; default
+                      this folder (the AppImage sets ~/.local/share/sotc-pc)
     SOTC_UPDATE_DIR   optional: the game update; by default <game>-UPDATE or <game>-patch next to
                       the dump (as shadPS4); its files take the place of the base game's
     SOTC_DLC_DIR      optional: the game's DLC (one folder per add-on with sce_sys/param.sfo,
                       or shadPS4's addcont folder holding CUSA08809)
     SOTC_MODES        optional, comma-separated: af16 (16x anisotropic filtering),
                       fps60 (removes the 30 FPS cap; experimental, vblank at 120 Hz)
+    SOTC_RENDER_RES   optional: the game renders at WxH instead of 1920x1080 (e.g. 2560x1080 for
+                      21:9, a wider view); the output follows its aspect; PS4 mode only; at most 1080
+                      lines tall and 4.2 million pixels, larger sizes are scaled down
     SOTC_CVARS        engine settings, NAME=VALUE separated by spaces (e.g. r_motionBlurEnable=0)
     BB_GAMEPAD        the gamepad to use (its name or part of it), when several are connected
     key.<input>=Keys, pad.<input>=buttons   remap the controls (README.md, Controles)
 The image is prepared again only when the game, the modules or the scripts change.
-Extra arguments go to bb-probe.exe.
+Extra arguments go to bb-probe (bb-probe.exe on Windows). On Linux: ./sotc.sh after ./build.sh.
 """
 import hashlib
 import os
@@ -30,6 +35,9 @@ import subprocess
 import sys
 
 PORT = Path(__file__).resolve().parent
+# Writable data (sotc.ini, out/, user/): the port's folder unless SOTC_DATA_DIR names another
+# (packaged builds such as the AppImage, whose own folder is read-only).
+DATA = Path(os.environ.get('SOTC_DATA_DIR') or PORT).resolve()
 SCRIPTS = PORT / 'scripts'
 SYS_MODULES = ('libSceUlt.sprx', 'libSceNgs2.sprx')
 
@@ -40,7 +48,7 @@ def fail(message):
 
 
 def load_ini():
-    ini = PORT / 'sotc.ini'
+    ini = DATA / 'sotc.ini'
     if ini.is_file():
         for line in ini.read_text(encoding='utf-8', errors='replace').splitlines():
             line = line.strip()
@@ -51,15 +59,42 @@ def load_ini():
 
 def no_console():
     """Started without a console (the launcher): console programs must not open their own."""
+    if os.name != 'nt':
+        return 0
     import ctypes
     return 0 if ctypes.windll.kernel32.GetConsoleWindow() else subprocess.CREATE_NO_WINDOW
 
 
 def find_probe():
-    for candidate in (PORT / 'bin' / 'bb-probe.exe', PORT / 'out' / 'bb-probe.exe'):
+    name = 'bb-probe.exe' if os.name == 'nt' else 'bb-probe'
+    for candidate in (PORT / 'bin' / name, PORT / 'out' / name):
         if candidate.is_file():
             return candidate
-    fail('bb-probe.exe not found: build it with build.sh (MSYS2 CLANG64) or use a packaged build.')
+    fail(f'{name} not found: build it with build.sh (MSYS2 CLANG64 on Windows) or use a packaged build.')
+
+
+# Above about 4.2 million rendered pixels the fine detail textures (ground, cloth) shimmer, flicker
+# and then disappear (2736x1536 is fine, 3008x1696 shimmers, 3840x2160 has none); cause unknown.
+# The game itself never renders more than 1080 lines in PS4 mode, so the render height stays at
+# most 1080 (3840x1080 for 32:9 is tested fine) and the pixel limit covers wider aspects.
+MAX_RENDER_HEIGHT = 1080
+MAX_RENDER_PIXELS = 4_200_000
+
+
+def cap_render(size):
+    """SOTC_RENDER_RES WxH, scaled down (same aspect, multiples of 8) to MAX_RENDER_HEIGHT lines
+    and MAX_RENDER_PIXELS."""
+    try:
+        w, h = map(int, size.split('x'))
+    except ValueError:
+        return size  # sotc_modes.py reports it
+    scale = min(1.0, MAX_RENDER_HEIGHT / h, (MAX_RENDER_PIXELS / (w * h)) ** 0.5)
+    if scale == 1.0:
+        return size
+    capped = f'{int(w * scale) // 8 * 8}x{int(h * scale) // 8 * 8}'
+    print(f'sotc: render size {size} is above {MAX_RENDER_HEIGHT} lines or {MAX_RENDER_PIXELS:,} pixels '
+          f'(fine textures disappear), rendering at {capped}', file=sys.stderr)
+    return capped
 
 
 def run_script(name, *args):
@@ -118,8 +153,9 @@ def merged_source(game, update, out):
 def main():
     load_ini()
     env = os.environ
-    os.chdir(PORT)
-    out = PORT / 'out'
+    DATA.mkdir(parents=True, exist_ok=True)
+    os.chdir(DATA)
+    out = DATA / 'out'
     out.mkdir(exist_ok=True)
     game = Path(env.get('SOTC_GAME_DIR', PORT.parent / 'CUSA08809')).resolve()
     if not (game / 'eboot.bin').is_file():
@@ -164,26 +200,44 @@ def main():
     if cvars is None:
         # Without the launcher: the culling settings of Pink-shadPS4 (same image, fewer GPU waits).
         cvars = 'doIndexBufferCulling=0 doSunShadowIndexBufferCulling=0'
-    run_script('sotc_modes.py', source, '--out', out, '--modes', modes, '--cvars', cvars)
+    render = cap_render(env.get('SOTC_RENDER_RES', '').strip())
+    run_script('sotc_modes.py', source, '--out', out, '--modes', modes, '--cvars', cvars,
+               *(['--render', render] if render else []))
+    if render:
+        # The output keeps the render size's aspect (a 16:9 output would stretch a 21:9 image).
+        try:
+            rw, rh = map(int, render.split('x'))
+            ow, oh = map(int, env.get('SOTC_OUTPUT_RES', '').split('x'))
+            same_aspect = abs(ow * rh - oh * rw) <= oh * rw // 100
+        except ValueError:
+            same_aspect = False
+        if not same_aspect:
+            env['SOTC_OUTPUT_RES'] = render
+        # Larger render targets: the game's heaps take what direct memory there is (run.sh).
+        env.setdefault('BB_DMEM_MB', '9152')
     if 'fps60' in modes.lower():
         # The game waits for vblanks: at 60 Hz an uncapped frame still rounds up to 30 FPS.
         env.setdefault('BB_VBLANK_HZ', '120')
 
     probe = find_probe()
     # Development builds run from the MSYS2 tree: its CLANG64 DLLs (SDL3, FFmpeg, ...).
-    if not (probe.parent / 'SDL3.dll').is_file():
+    if os.name == 'nt' and not (probe.parent / 'SDL3.dll').is_file():
         clang64 = Path(env.get('MSYS2_ROOT', r'C:\msys64')) / 'clang64' / 'bin'
         if clang64.is_dir():
             env['PATH'] = f'{clang64}{os.pathsep}{env.get("PATH", "")}'
-    user = Path(env.get('SOTC_USER_DIR', PORT / 'user')).resolve()
+    user = Path(env.get('SOTC_USER_DIR', DATA / 'user')).resolve()
     user.mkdir(parents=True, exist_ok=True)
     env.setdefault('BB_GPU_USER_DIR', str(user))
     # Controls: key.<input>= / pad.<input>= lines of sotc.ini remap keys and buttons (src/runtime_pad.c).
-    env.setdefault('BB_CONFIG', str(PORT / 'sotc.ini'))
+    env.setdefault('BB_CONFIG', str(DATA / 'sotc.ini'))
     command = [str(probe), str(out / 'boot-linked.bin'), '--content-profile', str(out / 'content.bin'),
                '--sotc-cpu', str(out / 'sotc-cpu.bin'), '--patches', str(out / 'patches.bin'),
                *(['--sotc-cmdline', str(out / 'cmdline.bin')] if (out / 'cmdline.bin').is_file() else []),
-               '--app0', str(game), '--user', str(user), *sys.argv[1:]]
+               '--app0', str(game), '--user', str(user),
+               # The Linux loader has a development watchdog (10 s by default) that ends the
+               # process with a stack dump; the game runs without it (BB_TIMEOUT=n for debugging).
+               *(['--timeout', env.get('BB_TIMEOUT', '0')] if os.name != 'nt' else []),
+               *sys.argv[1:]]
     # SOTC_WRAP: a JSON list put in front of the game, e.g. RenderDoc
     # ["C:/Program Files/RenderDoc/renderdoccmd.exe", "capture", "-w", "-c", "<file>"]; F12 then
     # captures the frame (SOTC_RDOC_SUBMITS submissions).

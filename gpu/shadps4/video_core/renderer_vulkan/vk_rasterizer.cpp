@@ -117,6 +117,7 @@ bool Rasterizer::FilterDraw() {
 }
 
 void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
+    const auto texture_lock = texture_cache.BatchLock(); // sotc: one lock for the targets
     // Prefetch render targets to handle overlaps with bound textures (e.g. mipgen)
     const auto& key = pipeline->GetGraphicsKey();
     const auto& regs = liverpool->regs;
@@ -820,14 +821,19 @@ void Rasterizer::FlushPeriodic() {
                    : 0u;
     }();
     // sotc: the command buffer wrote a page the guest reads back: submit it now, the GPU runs
-    // it while the guest gets there, and the readback finds it done (or nearly). SOTC_RB_EARLY=1
-    // turns it on; measured within noise on the attract demo, so off by default.
+    // it while the guest gets there, and the readback finds it done (or nearly). Within noise
+    // when the command processor was slower; on by default since 2026-10-16 (SOTC_RB_EARLY=0
+    // off): attract demo 53.6/54.5 -> 55.3/55.7 FPS (open world: 400-490 readbacks/s waited
+    // ~10% of the thread), Shrine unchanged (34.2 vs 34.1).
     if (SotcStats::kFpsLog) { // sotc: read only by the SOTC_FPS printer (sotc_stats.h)
-        SotcStats::commands.fetch_add(1, std::memory_order_relaxed);
+        // sotc: written by this thread only: a plain add, no lock prefix (an atomic RMW here
+        // waits for the thread's pending stores, ~1.8% of it). The printer takes deltas.
+        SotcStats::commands.store(SotcStats::commands.load(std::memory_order_relaxed) + 1,
+                                  std::memory_order_relaxed);
     }
     static const bool early = [] {
         const char* v = std::getenv("SOTC_RB_EARLY");
-        return v && v[0] == '1';
+        return !v || v[0] != '0';
     }();
     if (early && !scheduler.IsRendering() && buffer_cache.TakeHotWrite()) {
         SotcStats::early_flushes.fetch_add(1, std::memory_order_relaxed);
@@ -844,7 +850,7 @@ void Rasterizer::FlushPeriodic() {
     // 1000 instead of 500 (2026-10-15, RTX 3060 laptop, idle shrine ~5800 draws/frame): about +8%
     // in a single unpaired run (250: no gain, 2000: same as 1000): fewer submits, each one
     // cheaper per draw.
-    static const u64 flush_us = [] {
+    static const u64 flush_us = []() -> u64 {
         if (const char* v = std::getenv("SOTC_FLUSH_US")) {
             return std::strtoull(v, nullptr, 10);
         }
@@ -858,6 +864,11 @@ void Rasterizer::FlushPeriodic() {
     }
     ++commands_since_submit;
     if (flush_us != 0) {
+        // sotc: the clock is read every 8th command (~40 us at the Shrine against 1000 us),
+        // not on every one (~0.5% of the command processor in QueryPerformanceCounter).
+        if ((commands_since_submit & 7) != 0) {
+            return;
+        }
         const auto elapsed = std::chrono::steady_clock::now() - commands_since;
         const auto limit = std::chrono::microseconds(flush_us);
         if (elapsed < limit || (scheduler.IsRendering() && elapsed < limit * 4)) {
@@ -1283,6 +1294,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
 }
 
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
+    const auto texture_lock = texture_cache.BatchLock(); // sotc: one lock for the pass
     image_bindings.clear();
     const u32 first_image_idx = image_infos.size();
     // To emulate storing to explicit mip levels, build a descriptor array with each mip level.
@@ -1489,8 +1501,46 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         binding.unified += array_size;
     }
 
+    // sotc: at a render size above 1080 lines the game stretches its 1080p 2D art (splash logos,
+    // UI) itself, with the point sampler meant for 1:1 drawing: hard steps. A draw that samples
+    // one asset texture (never a render target, storage or depth image) magnifies bilinearly
+    // there. SOTC_UI_LINEAR=0/1 overrides, SOTC_UI_LINEAR_TRACE=1 lists the draws it changes.
+    static const bool ui_linear = [] {
+        if (const char* v = std::getenv("SOTC_UI_LINEAR"); v && *v) {
+            return *v != '0';
+        }
+        const char* r = std::getenv("SOTC_RENDER_RES");
+        return r && *r && std::strcmp(r, "1920x1080") != 0;
+    }();
+    const VideoCore::Image* ui_asset = nullptr;
+    if (ui_linear && image_bindings.size() == 1 && image_bindings[0].first &&
+        stage.images.size() == 1 && stage.images[0].array_size == 0) {
+        const auto& image = texture_cache.GetImage(image_bindings[0].first);
+        const auto& u = image.usage;
+        if (!u.render_target && !u.depth_target && !u.storage && !u.vo_surface &&
+            !image.binding.is_target && !image.info.props.is_depth &&
+            !AmdGpu::IsInteger(stage.images[0].GetSharp(stage).GetNumberFmt())) {
+            ui_asset = &image;
+        }
+    }
     for (const auto& sampler : stage.samplers) {
         auto ssharp = sampler.GetSharp(stage);
+        if (ui_asset && ssharp.xy_mag_filter.Value() == AmdGpu::Filter::Point &&
+            !sampler.is_depth) {
+            ssharp.xy_mag_filter.Assign(AmdGpu::Filter::Bilinear);
+            static const bool trace = std::getenv("SOTC_UI_LINEAR_TRACE") != nullptr;
+            if (trace) {
+                static std::mutex m;
+                static std::set<u64> seen;
+                std::scoped_lock lk{m};
+                if (seen.size() < 200 && seen.insert(stage.pgm_hash ^ ui_asset->info.guest_address).second) {
+                    std::fprintf(stderr, "SOTC ui-linear pgm %#llx tex %#llx %ux%u\n",
+                                 static_cast<unsigned long long>(stage.pgm_hash),
+                                 static_cast<unsigned long long>(ui_asset->info.guest_address),
+                                 ui_asset->info.size.width, ui_asset->info.size.height);
+                }
+            }
+        }
         if (!ssharp.Valid() || (ssharp.border_color_type.Value() == AmdGpu::BorderColor::Custom &&
                                 liverpool->regs.ta_bc_base.Address() == 0)) {
             LOG_WARNING(Render_Vulkan,
@@ -1517,6 +1567,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 }
 
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
+    const auto texture_lock = texture_cache.BatchLock(); // sotc: one lock for the attachments
     attachment_feedback_loop = false;
     // sotc: SOTC_RT_FAST (default on) drops redundant attachment work: FindRenderTarget repeats
     // UpdateImage only when the image still needs it, and the CMASK/HTILE clear bit is read and
